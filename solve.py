@@ -5,6 +5,8 @@ python solve.py --edges 0-1,1-2 --mode mono --k 3 --shard 0 --shards 4 --out sha
 import argparse
 import json
 import multiprocessing as mp
+import multiprocessing.connection
+import os
 import time
 
 from pysat.solvers import Cadical153
@@ -15,7 +17,7 @@ from verify import verify_circuit
 
 
 def worker(conn, n, edges, mode, k):
-    """One solver process. It keeps learned clauses from cube to cube."""
+    """Solver process body. It keeps learned clauses from cube to cube."""
     enc = Encoding(n, edges, mode, k)
     with Cadical153(bootstrap_with=enc.clauses) as sv:
         conn.send("ready")
@@ -27,59 +29,100 @@ def worker(conn, n, edges, mode, k):
                 conn.send(("UNSAT", None))
 
 
-class Solver:
-    """Runs the worker in a child process so that a cube can be stopped on timeout."""
+class Worker:
+    """One solver process, so that a cube can be stopped on timeout."""
 
-    def __init__(self, *spec):
-        self.spec = spec
-        self.proc = None
-
-    def solve(self, cube, timeout):
-        start = time.time()
-        if self.proc is None:
-            self.conn, child = mp.Pipe()
-            self.proc = mp.Process(target=worker, args=(child, *self.spec), daemon=True)
-            self.proc.start()
-            child.close()
-            if not self._wait(timeout):
-                return self._stop("TIMEOUT")
-            try:
-                self.conn.recv()
-            except EOFError:
-                return self._stop("ERROR")
-        self.conn.send(cube)
-        left = None if timeout is None else max(0.0, timeout - (time.time() - start))
-        if not self._wait(left):
-            return self._stop("TIMEOUT")
-        try:
-            return self.conn.recv()
-        except EOFError:
-            return self._stop("ERROR")
-
-    def _wait(self, timeout):
-        return self.conn.poll(timeout)
-
-    def _stop(self, status):
-        self.close()
-        return status, None
+    def __init__(self, spec):
+        ctx = mp.get_context("spawn")
+        self.conn, child = ctx.Pipe()
+        self.proc = ctx.Process(target=worker, args=(child, *spec), daemon=True)
+        self.proc.start()
+        child.close()
+        self.ready = False
+        self.cube = None        # index of the cube being solved
+        self.started = None
 
     def close(self):
-        if self.proc is not None:
-            self.proc.kill()
-            self.proc.join()
-            self.conn.close()
-            self.proc = None
+        self.proc.kill()
+        self.proc.join()
+        self.conn.close()
 
 
-def run_shard(edges_text, mode, k, shard, shards, out, time_limit=None, cube_timeout=None):
+def largest_first(cubes, indices):
+    """A cube that fixes fewer gates covers more of the search, so it goes first."""
+    return sorted(indices, key=lambda i: (len(cubes[i]), i))
+
+
+def solve_cubes(spec, cubes, order, workers, time_limit=None, cube_timeout=None):
+    """Yield (index, status, circuit, seconds) as cubes finish, on parallel processes.
+
+    The cube timeout counts from the moment the cube is sent to a ready worker.
+    Closing the generator stops all processes.
+    """
+    end = None if time_limit is None else time.time() + time_limit
+    pending = list(order)
+    pool = []
+    try:
+        while pending or any(w.cube is not None for w in pool):
+            if end is not None and time.time() >= end:
+                for w in pool:
+                    if w.cube is not None:
+                        yield w.cube, "TIMEOUT", None, time.time() - w.started
+                for i in pending:
+                    yield i, "TIMEOUT", None, 0.0
+                return
+            free = sum(w.cube is None for w in pool)     # building or idle
+            while len(pool) < workers and free < len(pending):
+                pool.append(Worker(spec))
+                free += 1
+            for w in pool:
+                if w.ready and w.cube is None and pending:
+                    w.cube, w.started = pending.pop(0), time.time()
+                    w.conn.send(cubes[w.cube])
+            deadlines = [] if end is None else [end]
+            if cube_timeout is not None:
+                deadlines += [w.started + cube_timeout for w in pool if w.cube is not None]
+            wait = max(0.0, min(deadlines) - time.time()) if deadlines else None
+            readable = mp.connection.wait([w.conn for w in pool], wait)
+            for w in list(pool):
+                if w.conn in readable:
+                    try:
+                        message = w.conn.recv()
+                    except (EOFError, ConnectionError):
+                        pool.remove(w)
+                        w.close()
+                        if w.cube is not None:
+                            yield w.cube, "ERROR", None, time.time() - w.started
+                        elif pending:
+                            # died while building: charge one cube, so the loop ends
+                            yield pending.pop(0), "ERROR", None, 0.0
+                        continue
+                    if not w.ready:
+                        w.ready = True
+                    else:
+                        i, w.cube = w.cube, None
+                        yield (i, *message, time.time() - w.started)
+                elif (cube_timeout is not None and w.cube is not None
+                        and time.time() >= w.started + cube_timeout):
+                    pool.remove(w)
+                    w.close()
+                    yield w.cube, "TIMEOUT", None, time.time() - w.started
+    finally:
+        for w in pool:
+            w.close()
+
+
+def run_shard(edges_text, mode, k, shard, shards, out, time_limit=None, cube_timeout=None,
+              workers=None):
     if not 0 <= shard < shards:
         raise ValueError("need 0 <= shard < shards")
     n, edges = parse_edges(edges_text)
     cubes = make_cubes(n, mode, k, shards)
+    workers = workers or os.cpu_count() or 1
     report = {
         "n": n, "edges": [list(e) for e in edges], "mode": mode, "k": k,
         "shard": shard, "shards": shards, "total_cubes": len(cubes),
-        "seconds": 0.0, "results": [],
+        "workers": workers, "seconds": 0.0, "results": [],
     }
 
     def save():
@@ -89,21 +132,12 @@ def run_shard(edges_text, mode, k, shard, shards, out, time_limit=None, cube_tim
 
     start = time.time()
     save()
-    solver = Solver(n, edges, mode, k)
+    order = largest_first(cubes, shard_indices(len(cubes), shard, shards))
+    finished = solve_cubes((n, edges, mode, k), cubes, order, workers, time_limit, cube_timeout)
     try:
-        for i in shard_indices(len(cubes), shard, shards):
-            limits = [cube_timeout]
-            if time_limit is not None:
-                limits.append(time_limit - (time.time() - start))
-            limits = [x for x in limits if x is not None]
-            timeout = min(limits) if limits else None
-            t = time.time()
-            if timeout is not None and timeout <= 0:
-                status, circuit = "TIMEOUT", None
-            else:
-                status, circuit = solver.solve(cubes[i], timeout)
+        for i, status, circuit, seconds in finished:
             entry = {"cube": i, "choices": cubes[i], "status": status,
-                     "seconds": round(time.time() - t, 3)}
+                     "seconds": round(seconds, 3)}
             if status == "SAT":
                 fault = verify_circuit(n, edges, mode, k, circuit)
                 entry["circuit"] = circuit
@@ -118,7 +152,7 @@ def run_shard(edges_text, mode, k, shard, shards, out, time_limit=None, cube_tim
                     raise SystemExit(f"circuit failed verification: {entry['fault']}")
                 break
     finally:
-        solver.close()
+        finished.close()
         save()
     return report
 

@@ -71,5 +71,6 @@ exhaustive (no assignment of the split gates is outside all of them) and disjoin
 (no two can hold together). It runs in the `plan` job before any solving and again
 in the `aggregate` job.
 
-Each shard runs one solver process and stops after its first verified circuit.
-The other shards keep running.
+Each shard runs one solver process per CPU core (`os.cpu_count()`). It takes the
+cubes that fix only gate 0 first, because they cover more of the search. A shard
+stops after its first verified circuit. The other shards keep running.

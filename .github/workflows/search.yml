@@ -51,8 +51,8 @@ jobs:
     outputs:
       matrix: ${{ steps.plan.outputs.matrix }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - run: pip install "$PYSAT"
@@ -84,8 +84,8 @@ jobs:
       matrix:
         shard: ${{ fromJSON(needs.plan.outputs.matrix) }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - run: pip install "$PYSAT"
@@ -98,7 +98,7 @@ jobs:
           --shard "$SHARD" --shards "$SHARDS" --out "shard-$SHARD.json"
           --time-limit "$(( (TIMEOUT_MINUTES - 3) * 60 ))"
       - if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: shard-${{ matrix.shard }}
           path: shard-${{ matrix.shard }}.json
@@ -110,12 +110,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - run: pip install "$PYSAT"
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         continue-on-error: true
         with:
           pattern: shard-*
@@ -126,7 +126,7 @@ jobs:
           python aggregate.py --edges "$EDGES" --mode "$MODE" --k "$K" --shards "$SHARDS" \
             --dir results --out aggregate.json | tee summary.txt
           { echo '```'; cat summary.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: aggregate
           path: aggregate.json
