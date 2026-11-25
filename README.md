@@ -61,10 +61,11 @@ A green workflow run only means the search ran. Read the verdict.
 
 ## How the split works
 
-A cube fixes the operation and operands of gate 0, or of gates 0 and 1. It starts
-with one cube per choice of gate 0, then expands cubes into one child per choice
-of gate 1 until there are at least 8 cubes per shard, so the count can overshoot
-that target. Shard `i` of `S` takes cubes `i, i+S, i+2S, ...`.
+A cube fixes the operation and operands of the first gates. Every cube fixes
+gates 0 and 1 (only gate 0 when k = 1). If that gives fewer than 32 cubes per
+shard and k is at least 3, cubes are expanded into one child per choice of gate 2
+until there are enough. The count can be well above 32 per shard. Shard `i` of `S`
+takes cubes `i, i+S, i+2S, ...`.
 
 `check_partition` in `cubes.py` proves with the SAT solver that the cubes are
 exhaustive (no assignment of the split gates is outside all of them) and disjoint
@@ -72,5 +73,5 @@ exhaustive (no assignment of the split gates is outside all of them) and disjoin
 in the `aggregate` job.
 
 Each shard runs one solver process per CPU core (`os.cpu_count()`). It takes the
-cubes that fix only gate 0 first, because they cover more of the search. A shard
+cubes that fix fewer gates first, because they cover more of the search. A shard
 stops after its first verified circuit. The other shards keep running.

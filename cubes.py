@@ -1,27 +1,31 @@
-"""Cube generation: split one search on the choices of gate 0 and gate 1.
+"""Cube generation: split one search on the choices of the first gates.
 
-A cube is a list of [gate, op, a, b] choices. Start with one cube per choice of
-gate 0, then replace cubes, one at a time, by their children (one per choice of
-gate 1) until there are at least CUBES_PER_SHARD * shards cubes.
+A cube is a list of [gate, op, a, b] choices. Every cube fixes gates 0 and 1
+(only gate 0 when k = 1). If that gives fewer than CUBES_PER_SHARD * shards
+cubes and k >= 3, cubes are replaced, one at a time, by their children (one per
+choice of gate 2) until there are enough.
 """
 from pysat.solvers import Cadical153
 
 from minc import selector_choices
 
-CUBES_PER_SHARD = 8
+CUBES_PER_SHARD = 32
 
 
 def make_cubes(n, mode, k, shards):
     target = CUBES_PER_SHARD * shards
-    first = [[[0, *c]] for c in selector_choices(n, mode, 0)]
-    if k < 2:
-        return first
-    second = [[1, *c] for c in selector_choices(n, mode, 1)]
+    cubes = [[]]
+    for g in range(min(k, 2)):
+        choices = selector_choices(n, mode, g)
+        cubes = [parent + [[g, *c]] for parent in cubes for c in choices]
+    if k < 3:
+        return cubes
+    third = [[2, *c] for c in selector_choices(n, mode, 2)]
     children = []
-    while first and len(first) + len(children) < target:
-        parent = first.pop(0)
-        children.extend(parent + [list(c)] for c in second)
-    return first + children
+    while cubes and len(cubes) + len(children) < target:
+        parent = cubes.pop(0)
+        children.extend(parent + [list(c)] for c in third)
+    return cubes + children
 
 
 def shard_indices(total, shard, shards):
