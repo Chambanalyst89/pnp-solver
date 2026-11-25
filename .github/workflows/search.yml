@@ -1,0 +1,132 @@
+name: search
+run-name: search ${{ inputs.mode }} k=${{ inputs.k }} ${{ inputs.tag }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      edges:
+        description: Graph edges, e.g. 0-1,1-2,0-2
+        required: true
+        type: string
+      mode:
+        description: mono (AND/OR) or not (at most one NOT gate)
+        required: true
+        type: choice
+        options: [mono, not]
+      k:
+        description: Number of gates
+        required: true
+        type: number
+      shards:
+        description: Parallel jobs (1 to 20)
+        required: true
+        default: 4
+        type: number
+      timeout-minutes:
+        description: Time limit per shard job (5 to 350)
+        required: true
+        default: 60
+        type: number
+      tag:
+        description: Label used by drive.py to find its run
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+# Inputs reach the shell only through environment variables.
+env:
+  EDGES: ${{ inputs.edges }}
+  MODE: ${{ inputs.mode }}
+  K: ${{ inputs.k }}
+  SHARDS: ${{ inputs.shards }}
+  TIMEOUT_MINUTES: ${{ inputs.timeout-minutes }}
+  PYSAT: python-sat==1.9.dev25
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install "$PYSAT"
+      - id: plan
+        name: Validate inputs and check the cube partition
+        run: |
+          python - <<'EOF'
+          import json, os
+          from cubes import check_partition, make_cubes
+          from minc import Encoding, parse_edges
+          n, edges = parse_edges(os.environ["EDGES"])
+          mode, k = os.environ["MODE"], int(os.environ["K"])
+          shards, minutes = int(os.environ["SHARDS"]), int(os.environ["TIMEOUT_MINUTES"])
+          assert 1 <= shards <= 20, "shards must be 1 to 20"
+          assert 5 <= minutes <= 350, "timeout-minutes must be 5 to 350"
+          cubes = make_cubes(n, mode, k, shards)
+          check_partition(Encoding(n, edges, mode, k), cubes)
+          print(f"{len(cubes)} cubes, exhaustive and disjoint, over {shards} shards")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+              out.write(f"matrix={json.dumps(list(range(shards)))}\n")
+          EOF
+
+  solve:
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ fromJSON(inputs.timeout-minutes) }}
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install "$PYSAT"
+      - name: Solve shard
+        env:
+          SHARD: ${{ matrix.shard }}
+        # The solver stops 3 minutes before the job limit so the report gets uploaded.
+        run: >
+          python solve.py --edges "$EDGES" --mode "$MODE" --k "$K"
+          --shard "$SHARD" --shards "$SHARDS" --out "shard-$SHARD.json"
+          --time-limit "$(( (TIMEOUT_MINUTES - 3) * 60 ))"
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: shard-${{ matrix.shard }}
+          path: shard-${{ matrix.shard }}.json
+          if-no-files-found: ignore
+
+  aggregate:
+    needs: [plan, solve]
+    if: ${{ !cancelled() && needs.plan.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install "$PYSAT"
+      - uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          pattern: shard-*
+          path: results
+      - name: Aggregate
+        run: |
+          mkdir -p results
+          python aggregate.py --edges "$EDGES" --mode "$MODE" --k "$K" --shards "$SHARDS" \
+            --dir results --out aggregate.json | tee summary.txt
+          { echo '```'; cat summary.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aggregate
+          path: aggregate.json
